@@ -104,6 +104,11 @@ static const long long kBWSteps[5]     = { 1000LL, 10000LL, 100000LL, 1000000LL,
 static const char*     kBWStepLabels[5] = { "1 kHz", "10 kHz", "100 kHz", "1 MHz", "10 MHz" };
 static int gBWStepIdx = 1;	// default: 10 kHz
 
+// --- XO (reference clock) correction ---------------------------------------
+// Device-level ad9361-phy attribute, nominal 40 MHz reference. Applies live,
+// no Pluto reboot needed (see ApplyXOCorrection() for details/caveats).
+static long long gXOCorrHz = 40000000LL;
+
 volatile int64_t	glLOfreq = 0L;
 bool	gbInitHW = false;
 
@@ -158,12 +163,13 @@ static void SaveSettingsToFile()
 	fprintf(f, "SDR=%s\n", gSDR);
 	fprintf(f, "DialogX=%d\n", gDialogX);
 	fprintf(f, "DialogY=%d\n", gDialogY);
+	fprintf(f, "XOCorrHz=%lld\n", gXOCorrHz);
 
 	fclose(f);
 
 #ifdef _MYDEBUG
-	printf("SaveSettingsToFile: wrote %s (GainDB=%.2f BWHz=%lld BWAuto=%d)\n",
-		path, gGainDB, gBWHz, gBWAuto ? 1 : 0);
+	printf("SaveSettingsToFile: wrote %s (GainDB=%.2f BWHz=%lld BWAuto=%d XOCorrHz=%lld)\n",
+		path, gGainDB, gBWHz, gBWAuto ? 1 : 0, gXOCorrHz);
 #endif
 }
 
@@ -205,6 +211,7 @@ static void LoadSettingsFromFile()
 		else if (strcmp(key, "SDR")           == 0) { strncpy(gSDR, val, sizeof(gSDR) - 1); gSDR[sizeof(gSDR) - 1] = '\0'; }
 		else if (strcmp(key, "DialogX")       == 0) { gDialogX = atoi(val); }
 		else if (strcmp(key, "DialogY")       == 0) { gDialogY = atoi(val); }
+		else if (strcmp(key, "XOCorrHz")      == 0) { gXOCorrHz = _atoi64(val); }
 	}
 
 	fclose(f);
@@ -217,9 +224,18 @@ static void LoadSettingsFromFile()
 	}
 
 #ifdef _MYDEBUG
-	printf("LoadSettingsFromFile: read %d line(s) from %s -> GainDB=%.2f BWHz=%lld BWAuto=%d GainModeIdx=%d SampleRateIdx=%d DialogX=%d DialogY=%d\n",
-		linesRead, path, gGainDB, gBWHz, gBWAuto ? 1 : 0, gGainModeIdx, giExtSrateIdx, gDialogX, gDialogY);
+	printf("LoadSettingsFromFile: read %d line(s) from %s -> GainDB=%.2f BWHz=%lld BWAuto=%d GainModeIdx=%d SampleRateIdx=%d DialogX=%d DialogY=%d XOCorrHz=%lld\n",
+		linesRead, path, gGainDB, gBWHz, gBWAuto ? 1 : 0, gGainModeIdx, giExtSrateIdx, gDialogX, gDialogY, gXOCorrHz);
 #endif
+}
+
+//---------------------------------------------------------------------------
+// Returns the ad9361-phy device itself (for device-level attributes, as
+// opposed to per-channel ones like gain/bandwidth).
+static struct iio_device* GetPhyDevice()
+{
+	if (!ctx) return NULL;
+	return iio_context_find_device(ctx, "ad9361-phy");
 }
 
 //---------------------------------------------------------------------------
@@ -227,8 +243,7 @@ static void LoadSettingsFromFile()
 // used for both gain and analog filter bandwidth attributes.
 static struct iio_channel* GetRxPhyChan()
 {
-	if (!ctx) return NULL;
-	struct iio_device* phy = iio_context_find_device(ctx, "ad9361-phy");
+	struct iio_device* phy = GetPhyDevice();
 	if (!phy) return NULL;
 	return iio_device_find_channel(phy, "voltage0", false);
 }
@@ -259,6 +274,25 @@ static void ApplyBandwidth()
 
 	if (iio_channel_attr_write_longlong(chn, "rf_bandwidth", gBWHz) < 0) {
 		DbgPrintf("rf_bandwidth set failed\n");
+	}
+}
+
+//---------------------------------------------------------------------------
+// Pushes the current XO (reference clock) correction, in Hz, to the
+// hardware. This is a device-level attribute of ad9361-phy (not a
+// per-channel one) - it's a purely digital correction that tells the
+// driver the actual frequency of the 40 MHz reference oscillator, which it
+// uses to recompute all PLL settings. Applies immediately, live, without
+// rebooting the Pluto - it just doesn't survive a Pluto power-cycle unless
+// separately persisted on the device itself (e.g. via "fw_setenv
+// xo_correction <value>" over SSH, which only takes effect on next boot).
+static void ApplyXOCorrection()
+{
+	struct iio_device* phy = GetPhyDevice();
+	if (!phy) return;
+
+	if (iio_device_attr_write_longlong(phy, "xo_correction", gXOCorrHz) < 0) {
+		DbgPrintf("xo_correction set failed\n");
 	}
 }
 
@@ -321,6 +355,9 @@ void UpdateDialog()
 	SendDlgItemMessageA(h_dialog, IDC_COMBO_SRATE, CB_SETCURSEL, (WPARAM)giExtSrateIdx, 0);
 
 	SendDlgItemMessageA(h_dialog, IDC_COMBO_BWSTEP, CB_SETCURSEL, (WPARAM)gBWStepIdx, 0);
+
+	snprintf(buf, sizeof(buf), "%lld", gXOCorrHz);
+	SetDlgItemTextA(h_dialog, IDC_EDIT_XOCORR, buf);
 }
 
 //---------------------------------------------------------------------------
@@ -384,6 +421,29 @@ static LRESULT CALLBACK EditBWSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, L
 		return 0;
 	}
 	return CallWindowProc(gOrigEditBWProc, hwnd, msg, wParam, lParam);
+}
+
+static WNDPROC gOrigEditXOCorrProc = NULL;
+
+static LRESULT CALLBACK EditXOCorrSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	if (msg == WM_MOUSEWHEEL) {
+		int steps = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+		if (steps != 0) {
+			char buf[32];
+			GetWindowTextA(hwnd, buf, sizeof(buf));
+			long long xo = _atoi64(buf) + (long long)steps * 1LL; // 1 Hz per wheel notch - fine calibration control
+			if (xo < 39000000LL) xo = 39000000LL;
+			if (xo > 41000000LL) xo = 41000000LL;
+			gXOCorrHz = xo;
+			snprintf(buf, sizeof(buf), "%lld", gXOCorrHz);
+			SetWindowTextA(hwnd, buf);
+			ApplyXOCorrection();
+			SaveSettingsToFile();
+		}
+		return 0;
+	}
+	return CallWindowProc(gOrigEditXOCorrProc, hwnd, msg, wParam, lParam);
 }
 
 //---------------------------------------------------------------------------
@@ -450,12 +510,14 @@ static INT_PTR CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
 		SendMessageA(hComboGM, CB_ADDSTRING, 0, (LPARAM)"Fast AGC");
 		SendMessageA(hComboGM, CB_ADDSTRING, 0, (LPARAM)"Hybrid AGC");
 
-		// Subclass the Gain / BW edit boxes so the mouse wheel can adjust
-		// their value while the caret is in the field.
+		// Subclass the Gain / BW / XO correction edit boxes so the mouse
+		// wheel can adjust their value while the caret is in the field.
 		gOrigEditGainProc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hwndDlg, IDC_EDIT_GAIN),
 			GWLP_WNDPROC, (LONG_PTR)EditGainSubclassProc);
 		gOrigEditBWProc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hwndDlg, IDC_EDIT_BW),
 			GWLP_WNDPROC, (LONG_PTR)EditBWSubclassProc);
+		gOrigEditXOCorrProc = (WNDPROC)SetWindowLongPtr(GetDlgItem(hwndDlg, IDC_EDIT_XOCORR),
+			GWLP_WNDPROC, (LONG_PTR)EditXOCorrSubclassProc);
 
 		// Populate BW mouse-wheel step combo box
 		HWND hComboBWStep = GetDlgItem(hwndDlg, IDC_COMBO_BWSTEP);
@@ -501,9 +563,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
 				else
 				{
 					gbInitHW = true;
-					// re-apply gain / bandwidth to the freshly (re)created context
+					// re-apply gain / bandwidth / XO correction to the freshly (re)created context
 					ApplyGain();
 					ApplyBandwidth();
+					ApplyXOCorrection();
 					SaveSettingsToFile();
 					MessageBoxA(NULL, "Connection successful!", "Info", MB_OK | MB_ICONINFORMATION);
 				};
@@ -616,6 +679,40 @@ static INT_PTR CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
 					char buf2[32];
 					snprintf(buf2, sizeof(buf2), "%lld", gBWHz);
 					SetDlgItemTextA(hwndDlg, IDC_EDIT_BW, buf2);
+				}
+				SaveSettingsToFile();
+
+				reentrant = false;
+				return TRUE;
+			}
+		}
+		break;
+
+		case IDC_EDIT_XOCORR:
+		{
+			// Apply on the fly as the user types, without a separate Apply button.
+			if (GET_WM_COMMAND_CMD(wParam, lParam) == EN_CHANGE) {
+				if (!gDialogReady) return TRUE;	// ignore phantom EN_CHANGE from control creation
+
+				static bool reentrant = false;
+				if (reentrant) return TRUE;
+				reentrant = true;
+
+				char buf[32];
+				GetDlgItemTextA(hwndDlg, IDC_EDIT_XOCORR, buf, sizeof(buf));
+				long long xo = _atoi64(buf);
+				bool clamped = false;
+				// Sanity clamp around the nominal 40 MHz reference; the
+				// exact valid range depends on the fitted TCXO/VCTCXO and
+				// is enforced by the hardware/driver itself on write.
+				if (xo < 39000000LL) { xo = 39000000LL; clamped = true; }
+				if (xo > 41000000LL) { xo = 41000000LL; clamped = true; }
+				gXOCorrHz = xo;
+				ApplyXOCorrection();
+				if (clamped) {
+					char buf2[32];
+					snprintf(buf2, sizeof(buf2), "%lld", gXOCorrHz);
+					SetDlgItemTextA(hwndDlg, IDC_EDIT_XOCORR, buf2);
 				}
 				SaveSettingsToFile();
 
@@ -864,6 +961,9 @@ int64_t EXTIO_API StartHW64(int64_t LOfreq)
 
 	// setting RX gain (mode + manual gain value, from GUI)
 	ApplyGain();
+
+	// setting XO (reference clock) correction, from GUI
+	ApplyXOCorrection();
 
 	// setting LO
 	chn = iio_device_find_channel(iio_context_find_device(ctx, "ad9361-phy"), "altvoltage0", true);
