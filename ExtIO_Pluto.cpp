@@ -297,6 +297,81 @@ static void ApplyXOCorrection()
 }
 
 //---------------------------------------------------------------------------
+// Reads the AD9361 and Zynq (XADC) die temperatures, in degrees Celsius.
+// Methodology matches Analog Devices' own reference script (pluto_temp.sh
+// from github.com/analogdevicesinc/plutosdr_scripts), which follows the
+// standard Linux IIO ABI conventions:
+//   AD9361:  ad9361-phy / temp0 / "input"           -> already milli-deg C
+//   Zynq:    xadc / temp0 / raw, offset, scale       -> (raw+offset)*scale, milli-deg C
+// Returns true only if both were read successfully; either value that
+// couldn't be read is left at 0.0 (not connected, or attribute missing on
+// this particular firmware/hardware revision).
+static bool ReadTemperatures(double* ad9361C, double* zynqC)
+{
+	*ad9361C = 0.0;
+	*zynqC = 0.0;
+
+	if (!ctx) return false;
+
+	bool ok = true;
+
+	struct iio_device* phy = GetPhyDevice();
+	struct iio_channel* phyTemp = phy ? iio_device_find_channel(phy, "temp0", false) : NULL;
+	if (phyTemp) {
+		double v = 0.0;
+		if (iio_channel_attr_read_double(phyTemp, "input", &v) == 0) {
+			*ad9361C = v / 1000.0;
+		}
+		else {
+			ok = false;
+		}
+	}
+	else {
+		ok = false;
+	}
+
+	struct iio_device* xadc = iio_context_find_device(ctx, "xadc");
+	struct iio_channel* xadcTemp = xadc ? iio_device_find_channel(xadc, "temp0", false) : NULL;
+	if (xadcTemp) {
+		double raw = 0.0, offset = 0.0, scale = 0.0;
+		bool gotAll = (iio_channel_attr_read_double(xadcTemp, "raw", &raw) == 0)
+			&& (iio_channel_attr_read_double(xadcTemp, "offset", &offset) == 0)
+			&& (iio_channel_attr_read_double(xadcTemp, "scale", &scale) == 0);
+		if (gotAll) {
+			*zynqC = (raw + offset) * scale / 1000.0;
+		}
+		else {
+			ok = false;
+		}
+	}
+	else {
+		ok = false;
+	}
+
+	return ok;
+}
+
+//---------------------------------------------------------------------------
+#define ID_TIMER_TEMPS 1001		// periodic AD9361/Zynq temperature refresh, see WM_TIMER
+
+static void UpdateTemperatureDisplay()
+{
+	if (!h_dialog) return;
+
+	double ad9361C = 0.0, zynqC = 0.0;
+	char buf[64];
+
+	if (ReadTemperatures(&ad9361C, &zynqC)) {
+		snprintf(buf, sizeof(buf), "AD9361: %.1f C   Zynq: %.1f C", ad9361C, zynqC);
+	}
+	else {
+		snprintf(buf, sizeof(buf), "AD9361: -- C   Zynq: -- C");	// not connected yet / attribute unavailable
+	}
+
+	SetDlgItemTextA(h_dialog, IDC_TEXT_TEMPS, buf);
+}
+
+//---------------------------------------------------------------------------
 // Common implementation for sample-rate change, used both by the host
 // (ExtIoSetSrate, called by HDSDR) and by the GUI's own sample-rate combo box.
 static int ApplySampleRateIdx(int srate_idx)
@@ -527,6 +602,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
 
 		UpdateDialog();		// shows the real, just-restored values
 		gDialogReady = true;	// EN_CHANGE from here on reflects genuine user input
+
+		SetTimer(hwndDlg, ID_TIMER_TEMPS, 2000, NULL);	// periodic AD9361/Zynq temperature refresh
+		UpdateTemperatureDisplay();	// show an initial reading right away, don't wait 2s
+
 		return TRUE;
 	}
 	break;
@@ -568,6 +647,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
 					ApplyBandwidth();
 					ApplyXOCorrection();
 					SaveSettingsToFile();
+					UpdateTemperatureDisplay();	// immediate feedback instead of waiting for the timer
 					MessageBoxA(NULL, "Connection successful!", "Info", MB_OK | MB_ICONINFORMATION);
 				};
 
@@ -746,12 +826,20 @@ static INT_PTR CALLBACK MainDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPAR
 		SaveSettingsToFile();
 		break;
 
+	case WM_TIMER:
+		if (wParam == ID_TIMER_TEMPS) {
+			UpdateTemperatureDisplay();
+			return TRUE;
+		}
+		break;
+
 	case WM_CLOSE:
 		ShowWindow(h_dialog, SW_HIDE);
 		return TRUE;
 		break;
 
 	case WM_DESTROY:
+		KillTimer(hwndDlg, ID_TIMER_TEMPS);
 		ShowWindow(h_dialog, SW_HIDE);
 		h_dialog = NULL;
 		return TRUE;
