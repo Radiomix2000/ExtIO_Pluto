@@ -249,7 +249,39 @@ static struct iio_channel* GetRxPhyChan()
 }
 
 //---------------------------------------------------------------------------
+// Reads the actual, currently valid RX gain range from the hardware via
+// the "hardwaregain_available" attribute (a standard IIO "min max step"
+// string). AD9361's usable manual-gain range shifts with the RF band (a
+// different gain table applies e.g. above/below ~1300 MHz), so the real
+// ceiling/floor can be well inside our generic -10..77 dB safety bound.
+// Falls back to that generic bound if the attribute can't be read (e.g.
+// not connected yet, or this firmware doesn't expose it).
+static void GetGainRange(double* minDB, double* maxDB)
+{
+	*minDB = -10.0;
+	*maxDB = 77.0;
+
+	struct iio_channel* chn = GetRxPhyChan();
+	if (!chn) return;
+
+	char buf[64];
+	if (iio_channel_attr_read(chn, "hardwaregain_available", buf, sizeof(buf)) < 0)
+		return;
+
+	double lo = 0.0, hi = 0.0, step = 0.0;
+	if (sscanf(buf, "%lf %lf %lf", &lo, &hi, &step) == 3) {
+		*minDB = lo;
+		*maxDB = hi;
+	}
+}
+
+//---------------------------------------------------------------------------
 // Pushes the current gain mode / manual gain value to the hardware.
+// Clamps gGainDB to the hardware's actual, currently valid range first
+// (see GetGainRange()) - this both prevents "hardwaregain set failed"
+// errors when the band-dependent ceiling is below our generic safety
+// bound, and makes the wheel/typed value settle at whatever the real
+// maximum is instead of getting stuck failing above it.
 static void ApplyGain()
 {
 	struct iio_channel* chn = GetRxPhyChan();
@@ -259,8 +291,21 @@ static void ApplyGain()
 		DbgPrintf("gain_control_mode set failed\n");
 	}
 	if (gGainModeIdx == 0) { // manual gain only makes sense in manual mode
+		double minDB, maxDB;
+		GetGainRange(&minDB, &maxDB);
+		if (gGainDB < minDB) gGainDB = (float)minDB;
+		if (gGainDB > maxDB) gGainDB = (float)maxDB;
+
 		if (iio_channel_attr_write_double(chn, "hardwaregain", (double)gGainDB) < 0) {
-			DbgPrintf("hardwaregain set failed\n");
+			// Deliberately no DbgPrintf/MessageBox here: we already clamp
+			// to the hardware-reported range above, so a failure at this
+			// point is rare (e.g. right at a band-edge transition) and
+			// popping a blocking error dialog on every such occurrence -
+			// which can happen repeatedly while just turning the mouse
+			// wheel - is disruptive. Trace it in the debug console only.
+#ifdef _MYDEBUG
+			printf("hardwaregain set failed (tried %.1f dB, range was %.1f..%.1f)\n", gGainDB, minDB, maxDB);
+#endif
 		}
 	}
 }
@@ -631,12 +676,17 @@ static LRESULT CALLBACK EditGainSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
 			char buf[32];
 			GetWindowTextA(hwnd, buf, sizeof(buf));
 			float g = (float)atof(buf) + steps * 1.0f; // 1 dB per wheel notch
+			// Generous safety bound only - ApplyGain() below clamps to the
+			// real, currently valid (frequency-dependent) hardware range
+			// and may adjust gGainDB further; that's what actually gets
+			// displayed, so scrolling past the real max/min just settles
+			// there instead of failing or running away.
 			if (g < -10.0f) g = -10.0f;
-			if (g > 77.0f)  g = 77.0f;
+			if (g > 90.0f)  g = 90.0f;
 			gGainDB = g;
+			ApplyGain();
 			snprintf(buf, sizeof(buf), "%.1f", gGainDB);
 			SetWindowTextA(hwnd, buf);
-			ApplyGain();
 			SaveSettingsToFile();
 		}
 		return 0;
