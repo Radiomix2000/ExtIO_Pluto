@@ -372,6 +372,175 @@ static void UpdateTemperatureDisplay()
 }
 
 //---------------------------------------------------------------------------
+// Baseband sample-rate configuration with automatic FIR filter management.
+//
+// This is a direct C++ port of ad9361_set_bb_rate() / ad9361_set_trx_fir_enable()
+// from Analog Devices' own libad9361-iio (github.com/analogdevicesinc/libad9361-iio,
+// ad9361_baseband_auto_rate.c), including its exact, pre-computed FIR tap
+// tables. Ported rather than linked as a separate library to avoid adding a
+// second prebuilt .lib dependency to the build.
+//
+// Why this is needed: below ~25e6/12 = 2.083 MSPS the AD9361's analog
+// half-band decimation stages alone can't reach the requested rate - the
+// digital RX/TX FIR decimation filter must be enabled and loaded with valid
+// taps first, or the driver rejects the "sampling_frequency" write with
+// -EINVAL ("sampling_frequency set failed" in our GUI). This is exactly the
+// bug reported: a freshly power-cycled Pluto starts with the FIR disabled,
+// so any of our sub-2.5 MS/s presets (2.048/1.536/1.000/0.528 MS/s) fail
+// until the FIR is (re)configured - which is what this function does.
+static int16_t kFir_128_4[] = {
+	-15,-27,-23,-6,17,33,31,9,-23,-47,-45,-13,34,69,67,21,-49,-102,-99,-32,69,146,143,48,-96,-204,-200,-69,129,278,275,97,-170,
+	-372,-371,-135,222,494,497,187,-288,-654,-665,-258,376,875,902,363,-500,-1201,-1265,-530,699,1748,1906,845,-1089,-2922,-3424,
+	-1697,2326,7714,12821,15921,15921,12821,7714,2326,-1697,-3424,-2922,-1089,845,1906,1748,699,-530,-1265,-1201,-500,363,902,875,
+	376,-258,-665,-654,-288,187,497,494,222,-135,-371,-372,-170,97,275,278,129,-69,-200,-204,-96,48,143,146,69,-32,-99,-102,-49,21,
+	67,69,34,-13,-45,-47,-23,9,31,33,17,-6,-23,-27,-15
+};
+static int16_t kFir_128_2[] = {
+	-0,0,1,-0,-2,0,3,-0,-5,0,8,-0,-11,0,17,-0,-24,0,33,-0,-45,0,61,-0,-80,0,104,-0,-134,0,169,-0,
+	-213,0,264,-0,-327,0,401,-0,-489,0,595,-0,-724,0,880,-0,-1075,0,1323,-0,-1652,0,2114,-0,-2819,0,4056,-0,-6883,0,20837,32767,
+	20837,0,-6883,-0,4056,0,-2819,-0,2114,0,-1652,-0,1323,0,-1075,-0,880,0,-724,-0,595,0,-489,-0,401,0,-327,-0,264,0,-213,-0,
+	169,0,-134,-0,104,0,-80,-0,61,0,-45,-0,33,0,-24,-0,17,0,-11,-0,8,0,-5,-0,3,0,-2,-0,1,0,-0,0
+};
+static int16_t kFir_96_2[] = {
+	-4,0,8,-0,-14,0,23,-0,-36,0,52,-0,-75,0,104,-0,-140,0,186,-0,-243,0,314,-0,-400,0,505,-0,-634,0,793,-0,
+	-993,0,1247,-0,-1585,0,2056,-0,-2773,0,4022,-0,-6862,0,20830,32767,20830,0,-6862,-0,4022,0,-2773,-0,2056,0,-1585,-0,1247,0,-993,-0,
+	793,0,-634,-0,505,0,-400,-0,314,0,-243,-0,186,0,-140,-0,104,0,-75,-0,52,0,-36,-0,23,0,-14,-0,8,0,-4,0
+};
+static int16_t kFir_64_2[] = {
+	-58,0,83,-0,-127,0,185,-0,-262,0,361,-0,-488,0,648,-0,-853,0,1117,-0,-1466,0,1954,-0,-2689,0,3960,-0,-6825,0,20818,32767,
+	20818,0,-6825,-0,3960,0,-2689,-0,1954,0,-1466,-0,1117,0,-853,-0,648,0,-488,-0,361,0,-262,-0,185,0,-127,-0,83,0,-58,0
+};
+
+#define AD9361_FIR_BUF_SIZE 8192
+#define AD9361_MIN_RATE_WITHOUT_FIR (25000000L / 12)	// 2,083,333 Hz - see comment above
+
+static int Ad9361SetTrxFirEnable(struct iio_device* dev, int enable)
+{
+	int ret = iio_device_attr_write_bool(dev, "in_out_voltage_filter_fir_en", !!enable);
+	if (ret < 0) {
+		struct iio_channel* outChn = iio_device_find_channel(dev, "out", false);
+		if (outChn) {
+			ret = iio_channel_attr_write_bool(outChn, "voltage_filter_fir_en", !!enable);
+		}
+	}
+	return ret;
+}
+
+static int Ad9361GetTrxFirEnable(struct iio_device* dev, int* enable)
+{
+	bool value = false;
+	int ret = iio_device_attr_read_bool(dev, "in_out_voltage_filter_fir_en", &value);
+	if (ret < 0) {
+		struct iio_channel* outChn = iio_device_find_channel(dev, "out", false);
+		if (outChn) {
+			ret = iio_channel_attr_read_bool(outChn, "voltage_filter_fir_en", &value);
+		}
+	}
+	if (ret >= 0) *enable = value ? 1 : 0;
+	return ret;
+}
+
+// Sets the baseband sample rate, automatically enabling/(re)loading the
+// digital FIR decimation filter when the requested rate needs it (below
+// AD9361_MIN_RATE_WITHOUT_FIR). Writes "sampling_frequency" on the RX
+// voltage0 channel (shared clock with TX - same as the rest of this file).
+static bool Ad9361SetBBRate(struct iio_device* dev, long rate)
+{
+	struct iio_channel* chan = GetRxPhyChan();
+	if (!chan) { DbgPrintf("chn not created\n"); return false; }
+
+	int dec, taps;
+	int16_t* fir;
+	if (rate <= 20000000L) { dec = 4; taps = 128; fir = kFir_128_4; }
+	else if (rate <= 40000000L) { dec = 2; taps = 128; fir = kFir_128_2; }
+	else if (rate <= 53333333L) { dec = 2; taps = 96;  fir = kFir_96_2; }
+	else { dec = 2; taps = 64;  fir = kFir_64_2; }
+
+	long long currentRate = 0;
+	if (iio_channel_attr_read_longlong(chan, "sampling_frequency", &currentRate) < 0) {
+		DbgPrintf("sampling_frequency read failed\n");
+		return false;
+	}
+
+	int enabled = 0;
+	if (Ad9361GetTrxFirEnable(dev, &enabled) < 0) {
+		DbgPrintf("filter_fir_en read failed\n");
+		return false;
+	}
+
+	if (enabled) {
+		// Can't disable the FIR while sitting below the halfband-only floor -
+		// bump to a safe intermediate rate first, same as the reference code.
+		if (currentRate <= AD9361_MIN_RATE_WITHOUT_FIR) {
+			iio_channel_attr_write_longlong(chan, "sampling_frequency", 3000000);
+		}
+		if (Ad9361SetTrxFirEnable(dev, 0) < 0) {
+			DbgPrintf("filter_fir_en disable failed\n");
+			return false;
+		}
+	}
+
+	// Build and upload the FIR filter config text blob (same format used by
+	// libiio's own "filter_fir_config" device attribute: RX/TX header lines
+	// followed by one "I,Q" tap pair per line).
+	char* buf = (char*)malloc(AD9361_FIR_BUF_SIZE);
+	if (!buf) return false;
+
+	int len = 0;
+	len += snprintf(buf + len, AD9361_FIR_BUF_SIZE - len, "RX 3 GAIN -6 DEC %d\n", dec);
+	len += snprintf(buf + len, AD9361_FIR_BUF_SIZE - len, "TX 3 GAIN 0 INT %d\n", dec);
+	for (int i = 0; i < taps; i++) {
+		len += snprintf(buf + len, AD9361_FIR_BUF_SIZE - len, "%d,%d\n", fir[i], fir[i]);
+	}
+	len += snprintf(buf + len, AD9361_FIR_BUF_SIZE - len, "\n");
+
+	int ret = iio_device_attr_write_raw(dev, "filter_fir_config", buf, len);
+	free(buf);
+	if (ret < 0) {
+		DbgPrintf("filter_fir_config upload failed\n");
+		return false;
+	}
+
+	if (rate <= AD9361_MIN_RATE_WITHOUT_FIR) {
+		char readbuf[100];
+		int dacrate = 0, txrate = 0, maxTaps = 0;
+		if (iio_device_attr_read(dev, "tx_path_rates", readbuf, sizeof(readbuf)) < 0) {
+			DbgPrintf("tx_path_rates read failed\n");
+			return false;
+		}
+		if (sscanf(readbuf, "BBPLL:%*d DAC:%d T2:%*d T1:%*d TF:%*d TXSAMP:%d", &dacrate, &txrate) != 2 || txrate == 0) {
+			DbgPrintf("tx_path_rates parse failed\n");
+			return false;
+		}
+		maxTaps = (dacrate / txrate) * 16;
+		if (maxTaps < taps) {
+			iio_channel_attr_write_longlong(chan, "sampling_frequency", 3000000);
+		}
+
+		if (Ad9361SetTrxFirEnable(dev, 1) < 0) {
+			DbgPrintf("filter_fir_en enable failed\n");
+			return false;
+		}
+		if (iio_channel_attr_write_longlong(chan, "sampling_frequency", rate) < 0) {
+			DbgPrintf("sampling_frequency set failed\n");
+			return false;
+		}
+	}
+	else {
+		if (iio_channel_attr_write_longlong(chan, "sampling_frequency", rate) < 0) {
+			DbgPrintf("sampling_frequency set failed\n");
+			return false;
+		}
+		if (Ad9361SetTrxFirEnable(dev, 1) < 0) {
+			DbgPrintf("filter_fir_en enable failed\n");
+			return false;
+		}
+	}
+
+	return true;
+}
+
+//---------------------------------------------------------------------------
 // Common implementation for sample-rate change, used both by the host
 // (ExtIoSetSrate, called by HDSDR) and by the GUI's own sample-rate combo box.
 static int ApplySampleRateIdx(int srate_idx)
@@ -390,8 +559,9 @@ static int ApplySampleRateIdx(int srate_idx)
 	rxcfg.bw_hz = gBWHz;
 
 	if (ctx) {
+		struct iio_device* phy = GetPhyDevice();
 		struct iio_channel* chn = GetRxPhyChan();
-		if (chn == NULL) {
+		if (phy == NULL || chn == NULL) {
 			DbgPrintf("chn not created\n");
 			return 1;
 		};
@@ -399,8 +569,7 @@ static int ApplySampleRateIdx(int srate_idx)
 			DbgPrintf("rf_bandwidth set failed\n");
 			return 1;
 		};
-		if (iio_channel_attr_write_longlong(chn, "sampling_frequency", rxcfg.fs_hz) < 0) {
-			DbgPrintf("sampling_frequency set failed\n");
+		if (!Ad9361SetBBRate(phy, (long)rxcfg.fs_hz)) {
 			return 1;
 		};
 	}
@@ -1043,9 +1212,12 @@ int64_t EXTIO_API StartHW64(int64_t LOfreq)
 	if (iio_channel_attr_write_longlong(chn, "rf_bandwidth", rxcfg.bw_hz) < 0) {
 		DbgPrintf("rf_bandwidth failed\n");
 	};
-	if (iio_channel_attr_write_longlong(chn, "sampling_frequency", rxcfg.fs_hz) < 0) {
-		DbgPrintf("sampling_frequency failed\n");
-	};
+	// Sample rate, with automatic FIR filter management for rates below the
+	// AD9361's halfband-only floor (~2.083 MSPS) - see Ad9361SetBBRate().
+	{
+		struct iio_device* phy = iio_context_find_device(ctx, "ad9361-phy");
+		if (phy) Ad9361SetBBRate(phy, (long)rxcfg.fs_hz);
+	}
 
 	// setting RX gain (mode + manual gain value, from GUI)
 	ApplyGain();
